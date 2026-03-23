@@ -1,8 +1,10 @@
-#property link          "https://www.earnforex.com/metatrader-expert-advisors/move-stop-breakeven/"
-#property version       "1.04"
+﻿#property link          "https://www.earnforex.com/metatrader-expert-advisors/move-stop-breakeven/"
+#property version       "1.05"
+
 #property strict
-#property copyright     "EarnForex.com - 2019-2025"
+#property copyright     "EarnForex.com - 2019-2026"
 #property description   "This expert advisor will move the stop-loss to breakeven when the price reach a distance from the open price."
+#property description   "Optional partial close and BE line display."
 #property description   ""
 #property description   "WARNING: Use this software at your own risk."
 #property description   "The creator of this EA cannot be held responsible for any damage or loss."
@@ -24,6 +26,7 @@ input string Comment_1 = "====================";  // Expert Advisor Settings
 input int DistanceFromOpen = 500;                 // Points of distance from the open price
 input int AdditionalProfit = 0;                   // Additional profit in points to add to BE
 input bool AdjustForSwapsCommission = false;      // Adjust for swaps & commission?
+input double PartialClosePercentage = 0;          // Partial close % (0 = disabled, 1-99)
 input string Comment_2 = "====================";  // Orders Filtering Options
 input bool OnlyCurrentSymbol = true;              // Apply to current symbol only
 input ENUM_CONSIDER OnlyType = All;               // Apply to
@@ -32,12 +35,18 @@ input int MagicNumber = 0;                        // Magic number (if above is t
 input bool UseComment = false;                    // Filter by comment
 input string CommentFilter = "";                  // Comment (if above is true)
 input bool EnableTrailingParam = false;           // Enable Breakeven EA
-input string Comment_3 = "====================";  // Notification Options
+input string Comment_3 = "====================";  // BE Trigger Line Display
+input bool ShowBELines = false;                   // Show BE trigger price lines
+input color BELineColor = clrGold;                // BE line color
+input ENUM_LINE_STYLE BELineStyle = STYLE_DASH;   // BE line style
+input int BELineWidth = 1;                        // BE line width (1-5)
+input int BELabelFontSize = 8;                    // BE label font size
+input string Comment_4 = "====================";  // Notification Options
 input bool EnableNotify = false;                  // Enable notifications feature
 input bool SendAlert = false;                     // Send alert notifications
 input bool SendApp = false;                       // Send notifications to mobile
 input bool SendEmail = false;                     // Send notifications via email
-input string Comment_3a = "===================="; // Graphical Window
+input string Comment_5 = "====================";  // Graphical Window
 input bool ShowPanel = true;                      // Show graphical panel
 input string IndicatorName = "MQLTA-MSBE";        // Indicator name (to name the objects)
 input int Xoff = 20;                              // Horizontal spacing for the control panel
@@ -48,6 +57,16 @@ input int FontSize = 10;                          // Font Size
 double DPIScale; // Scaling parameter for the panel based on the screen DPI.
 int PanelMovY, PanelLabX, PanelLabY, PanelRecX;
 bool EnableTrailing = EnableTrailingParam;
+
+// Prefixes for BE trigger line chart objects.
+string BELinePrefix;
+string BELabelPrefix;
+
+// Partial close order tracking (ticket + open time).
+bool     partialCloseEnabled;
+int      PCTrackedTickets[];
+datetime PCTrackedOpenTimes[];
+int      PCTrackedCount = 0;
 
 int OnInit()
 {
@@ -61,19 +80,30 @@ int OnInit()
     PanelLabY = PanelMovY;
     PanelRecX = PanelLabX + 4;
 
+    BELinePrefix  = IndicatorName + "-BEL-";
+    BELabelPrefix = IndicatorName + "-BET-";
+
     if (ShowPanel) DrawPanel();
+    if (ShowBELines && EnableTrailing) DrawBELines();
+
+    partialCloseEnabled = (PartialClosePercentage > 0 && PartialClosePercentage < 100);
+
+    if (partialCloseEnabled) BuildTrackedList();
+
     return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
     CleanPanel();
+    CleanBELines();
 }
 
 void OnTick()
 {
     if (EnableTrailing) TrailingStop();
     if (ShowPanel) DrawPanel();
+    if (ShowBELines && EnableTrailing) DrawBELines();
 }
 
 void OnChartEvent(const int id,
@@ -98,10 +128,16 @@ void OnChartEvent(const int id,
             }
         }
     }
+    else if (id == CHARTEVENT_CHART_CHANGE)
+    {
+        if (ShowBELines && EnableTrailing) DrawBELines();
+    }
 }
 
 void TrailingStop()
 {
+    if (partialCloseEnabled) SyncTrackedList();
+
     for (int i = 0; i < OrdersTotal(); i++)
     {
         if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES) == false)
@@ -117,6 +153,8 @@ void TrailingStop()
         if ((UseComment) && (StringFind(OrderComment(), CommentFilter) < 0)) continue;
         if ((OnlyType != All) && (OrderType() != OnlyType)) continue;
 
+        int ticket = OrderTicket();
+        datetime openTime = OrderOpenTime();
         double NewSL = 0;
         double NewTP = 0;
         string Instrument = OrderSymbol();
@@ -155,20 +193,58 @@ void TrailingStop()
     
                 if (NewSL - SLPrice > ePoint / 2) // Is NewSL higher than the old SL?
                 {
-                    bool result = OrderModify(OrderTicket(), OpenPrice, NewSL, OrderTakeProfit(), OrderExpiration());
+                    bool partialClosedNow = false;
+                    if (partialCloseEnabled)
+                    {
+                        if (IsPartialCloseRemainder(ticket, openTime))
+                        {
+                            if (!OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+                            {
+                                int Error = GetLastError();
+                                string ErrorText = GetLastErrorText(Error);
+                                Print("ERROR - Unable to select the order - ", Error);
+                                Print("ERROR - ", ErrorText);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            int pcResult = ExecutePartialClose(ticket, Instrument, eDigits);
+                            if (pcResult == 1)
+                            {
+                                int remTicket = FindRemainderTicket(openTime, Instrument, OP_BUY);
+                                if (remTicket < 0 || !OrderSelect(remTicket, SELECT_BY_TICKET, MODE_TRADES)) continue;
+                                partialClosedNow = true;
+                            }
+                            else if (pcResult == -1) continue;
+                            else if (!OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+                            {
+                                int Error = GetLastError();
+                                string ErrorText = GetLastErrorText(Error);
+                                Print("ERROR - Unable to select the order - ", Error);
+                                Print("ERROR - ", ErrorText);
+                                continue;
+                            }
+                        }
+                    }
+                    bool result = false;
+                    for (int attempt = 0; attempt < 10; attempt++)
+                    {
+                        result = OrderModify(OrderTicket(), OpenPrice, NewSL, OrderTakeProfit(), OrderExpiration());
+                        if (result) break;
+                        int Error = GetLastError();
+                        string ErrorText = GetLastErrorText(Error);
+                        Print("Error setting breakeven: Buy Order #", OrderTicket(), " attempt ", attempt + 1, "/10, error = ", Error, " (", ErrorText, "), open price = ", DoubleToString(OpenPrice, eDigits),
+                              ", old SL = ", DoubleToString(SLPrice, eDigits),
+                              ", new SL = ", DoubleToString(NewSL, eDigits), ", Bid = ", SymbolInfoDouble(Instrument, SYMBOL_BID), ", Ask = ", SymbolInfoDouble(Instrument, SYMBOL_ASK));
+                        Sleep(100);
+                    }
                     if (result)
                     {
                         Print("Success setting breakeven: Buy Order #", OrderTicket(), ", new stop-loss = ", DoubleToString(NewSL, eDigits));
                         NotifyStopLossUpdate(OrderTicket(), NewSL, Instrument);
                     }
-                    else
-                    {
-                        int Error = GetLastError();
-                        string ErrorText = GetLastErrorText(Error);
-                        Print("Error setting breakeven: Buy Order #", OrderTicket(), ", error = ", Error, " (", ErrorText, "), open price = ", DoubleToString(OpenPrice, eDigits),
-                              ", old SL = ", DoubleToString(SLPrice, eDigits),
-                              ", new SL = ", DoubleToString(NewSL, eDigits), ", Bid = ", SymbolInfoDouble(Instrument, SYMBOL_BID), ", Ask = ", SymbolInfoDouble(Instrument, SYMBOL_ASK));
-                    }
+                    if (partialClosedNow) continue;
                 }
             }
         }
@@ -184,23 +260,268 @@ void TrailingStop()
                 NewSL = NormalizeDouble(SLSell, eDigits);
                 if ((SLPrice - NewSL > ePoint / 2) || (SLPrice == 0)) // Is NewSL lower than the old SL or is there no old SL at all?
                 {
-                    bool result = OrderModify(OrderTicket(), OpenPrice, NewSL, OrderTakeProfit(), OrderExpiration());
+                    bool partialClosedNow = false;
+                    if (partialCloseEnabled)
+                    {
+                        if (IsPartialCloseRemainder(ticket, openTime))
+                        {
+                            if (!OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+                            {
+                                int Error = GetLastError();
+                                string ErrorText = GetLastErrorText(Error);
+                                Print("ERROR - Unable to select the order - ", Error);
+                                Print("ERROR - ", ErrorText);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            int pcResult = ExecutePartialClose(ticket, Instrument, eDigits);
+                            if (pcResult == 1)
+                            {
+                                int remTicket = FindRemainderTicket(openTime, Instrument, OP_SELL);
+                                if (remTicket < 0 || !OrderSelect(remTicket, SELECT_BY_TICKET, MODE_TRADES)) continue;
+                                partialClosedNow = true;
+                            }
+                            else if (pcResult == -1) continue;
+                            else if (!OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+                            {
+                                int Error = GetLastError();
+                                string ErrorText = GetLastErrorText(Error);
+                                Print("ERROR - Unable to select the order - ", Error);
+                                Print("ERROR - ", ErrorText);
+                                continue;
+                            }
+                        }
+                    }
+                    bool result = false;
+                    for (int attempt = 0; attempt < 10; attempt++)
+                    {
+                        result = OrderModify(OrderTicket(), OpenPrice, NewSL, OrderTakeProfit(), OrderExpiration());
+                        if (result) break;
+                        int Error = GetLastError();
+                        string ErrorText = GetLastErrorText(Error);
+                        Print("Error setting breakeven: Sell Order #", OrderTicket(), " attempt ", attempt + 1, "/10, error = ", Error, " (", ErrorText, "), open price = ", DoubleToString(OpenPrice, eDigits),
+                              ", old SL = ", DoubleToString(SLPrice, eDigits),
+                              ", new SL = ", DoubleToString(NewSL, eDigits), ", Bid = ", SymbolInfoDouble(Instrument, SYMBOL_BID), ", Ask = ", SymbolInfoDouble(Instrument, SYMBOL_ASK));
+                        Sleep(100);
+                    }
                     if (result)
                     {
                         Print("Success setting breakeven: Sell Order #", OrderTicket(), ", new stop-loss = ", DoubleToString(NewSL, eDigits));
                         NotifyStopLossUpdate(OrderTicket(), NewSL, Instrument);
                     }
-                    else
-                    {
-                        int Error = GetLastError();
-                        string ErrorText = GetLastErrorText(Error);
-                        Print("Error setting breakeven: Sell Order #", OrderTicket(), ", error = ", Error, " (", ErrorText, "), open price = ", DoubleToString(OpenPrice, eDigits),
-                              ", old SL = ", DoubleToString(SLPrice, eDigits),
-                              ", new SL = ", DoubleToString(NewSL, eDigits), ", Bid = ", SymbolInfoDouble(Instrument, SYMBOL_BID), ", Ask = ", SymbolInfoDouble(Instrument, SYMBOL_ASK));
-                    }
+                    if (partialClosedNow) continue;
                 }
             }
         }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Partial Close Helper Functions                                   |
+//+------------------------------------------------------------------+
+
+// Returns true if the given ticket is the remainder of a partial close
+// (not in the tracked list, but its openTime matches a tracked entry
+// whose ticket no longer exists among open trades).
+// NOTE: may change the currently selected order via OrderSelect.
+bool IsPartialCloseRemainder(int ticket, datetime openTime)
+{
+    // Is this ticket in the tracked list? If so, it's a known original.
+    for (int i = 0; i < PCTrackedCount; i++)
+    {
+        if (PCTrackedTickets[i] == ticket) return false;
+    }
+    // Ticket not in list. Check if openTime matches a tracked entry whose ticket is gone.
+    for (int i = 0; i < PCTrackedCount; i++)
+    {
+        if (PCTrackedOpenTimes[i] != openTime) continue;
+        // Matching openTime with a different ticket. Is that old ticket still open?
+        if (!OrderSelect(PCTrackedTickets[i], SELECT_BY_TICKET, MODE_TRADES))
+            return true; // Old ticket is gone - current order is its remainder.
+    }
+    return false; // New order, not a remainder.
+}
+
+// Attempts to partially close an order. The order must already be selected.
+// Returns: 1 = closed, 0 = skipped (lot constraints), -1 = failed.
+int ExecutePartialClose(int ticket, string instrument, int eDigits)
+{
+    double totalLots = OrderLots();
+    double minLot    = MarketInfo(instrument, MODE_MINLOT);
+    double lotStep   = MarketInfo(instrument, MODE_LOTSTEP);
+
+    double closeLots = MathFloor(totalLots * PartialClosePercentage / 100.0 / lotStep) * lotStep;
+    closeLots = NormalizeDouble(closeLots, 8);
+
+    if (closeLots < minLot)
+    {
+        Print("Partial close skipped for #", ticket, ": calculated lot (", DoubleToString(closeLots, 2),
+              ") below minimum (", DoubleToString(minLot, 2), ").");
+        return 0;
+    }
+    if (totalLots - closeLots < minLot)
+    {
+        Print("Partial close skipped for #", ticket, ": remaining lot would be below minimum.");
+        return 0;
+    }
+
+    double closePrice;
+    int slippage = (int)MarketInfo(instrument, MODE_SPREAD);
+
+    for (int attempt = 0; attempt < 10; attempt++)
+    {
+        if (OrderType() == OP_BUY)
+            closePrice = SymbolInfoDouble(instrument, SYMBOL_BID);
+        else
+            closePrice = SymbolInfoDouble(instrument, SYMBOL_ASK);
+
+        if (OrderClose(ticket, closeLots, NormalizeDouble(closePrice, eDigits), slippage, clrNONE))
+        {
+            Print("Partial close successful: Order #", ticket, ", closed ", DoubleToString(closeLots, 2),
+                  " lots (", DoubleToString(PartialClosePercentage, 1), "%) at ", DoubleToString(closePrice, eDigits));
+            return 1;
+        }
+
+        int Error = GetLastError();
+        string ErrorText = GetLastErrorText(Error);
+        Print("Partial close attempt ", attempt + 1, "/10 failed: Order #", ticket, ", lots = ", DoubleToString(closeLots, 2),
+              ", error = ", Error, " (", ErrorText, ")");
+        Sleep(100);
+    }
+    return -1;
+}
+
+// After a successful partial close, finds the remainder order by scanning for
+// an order with matching properties whose ticket is not in the tracked list.
+int FindRemainderTicket(datetime openTime, string instrument, int orderType)
+{
+    for (int i = 0; i < OrdersTotal(); i++)
+    {
+        if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if (OrderSymbol() != instrument) continue;
+        if (OrderType() != orderType) continue;
+        if (OrderOpenTime() != openTime) continue;
+        bool tracked = false;
+        for (int j = 0; j < PCTrackedCount; j++)
+        {
+            if (PCTrackedTickets[j] == OrderTicket()) { tracked = true; break; }
+        }
+        if (!tracked) return OrderTicket();
+    }
+    return -1;
+}
+
+// Full rebuild of the tracked order list. Used on init and when enabling the EA.
+void BuildTrackedList()
+{
+    PCTrackedCount = 0;
+    for (int i = 0; i < OrdersTotal(); i++)
+    {
+        if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if ((OnlyCurrentSymbol) && (OrderSymbol() != Symbol())) continue;
+        if ((UseMagic) && (OrderMagicNumber() != MagicNumber)) continue;
+        if ((UseComment) && (StringFind(OrderComment(), CommentFilter) < 0)) continue;
+        if ((OnlyType != All) && (OrderType() != OnlyType)) continue;
+        if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+        PCTrackedCount++;
+        ArrayResize(PCTrackedTickets, PCTrackedCount);
+        ArrayResize(PCTrackedOpenTimes, PCTrackedCount);
+        PCTrackedTickets[PCTrackedCount - 1] = OrderTicket();
+        PCTrackedOpenTimes[PCTrackedCount - 1] = OrderOpenTime();
+    }
+}
+
+// Incrementally syncs the tracked order list:
+// - Adds genuinely new orders (not already tracked, not remainders of dead entries).
+// - Removes dead entries only once the remainder's SL has been moved to BE
+//   (or the order is fully gone), so IsPartialCloseRemainder keeps working.
+void SyncTrackedList()
+{
+    // 1. Clean up dead entries whose job is done.
+    for (int r = PCTrackedCount - 1; r >= 0; r--)
+    {
+        // Is this tracked ticket still alive?
+        if (OrderSelect(PCTrackedTickets[r], SELECT_BY_TICKET, MODE_TRADES)) continue;
+        // Dead ticket. Find an open order with matching openTime (the remainder).
+        bool remainderDone = true;
+        for (int i = 0; i < OrdersTotal(); i++)
+        {
+            if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+            if (OrderOpenTime() != PCTrackedOpenTimes[r]) continue;
+            if ((OnlyCurrentSymbol) && (OrderSymbol() != Symbol())) continue;
+            if ((UseMagic) && (OrderMagicNumber() != MagicNumber)) continue;
+            if ((UseComment) && (StringFind(OrderComment(), CommentFilter) < 0)) continue;
+            if ((OnlyType != All) && (OrderType() != OnlyType)) continue;
+            // Found the remainder. Check if its SL has been moved to BE.
+            double ePoint = SymbolInfoDouble(OrderSymbol(), SYMBOL_POINT);
+            double openPrice = OrderOpenPrice();
+            double sl = OrderStopLoss();
+            if (sl == 0) { remainderDone = false; break; }
+            if (OrderType() == OP_BUY)
+            {
+                double targetSL = openPrice + AdditionalProfit * ePoint;
+                if (sl < targetSL - ePoint / 2) { remainderDone = false; break; }
+            }
+            else if (OrderType() == OP_SELL)
+            {
+                double targetSL = openPrice - AdditionalProfit * ePoint;
+                if (sl > targetSL + ePoint / 2) { remainderDone = false; break; }
+            }
+            break; // Found and checked - done.
+        }
+        if (remainderDone)
+        {
+            // Remove this entry (swap with last, shrink).
+            if (r < PCTrackedCount - 1)
+            {
+                PCTrackedTickets[r] = PCTrackedTickets[PCTrackedCount - 1];
+                PCTrackedOpenTimes[r] = PCTrackedOpenTimes[PCTrackedCount - 1];
+            }
+            PCTrackedCount--;
+        }
+    }
+
+    // 2. Add new filtered orders not already tracked and not remainders of dead entries.
+    for (int i = 0; i < OrdersTotal(); i++)
+    {
+        if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if ((OnlyCurrentSymbol) && (OrderSymbol() != Symbol())) continue;
+        if ((UseMagic) && (OrderMagicNumber() != MagicNumber)) continue;
+        if ((UseComment) && (StringFind(OrderComment(), CommentFilter) < 0)) continue;
+        if ((OnlyType != All) && (OrderType() != OnlyType)) continue;
+        if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+
+        int curTicket = OrderTicket();
+        datetime curOpenTime = OrderOpenTime();
+
+        // Already tracked?
+        bool found = false;
+        for (int j = 0; j < PCTrackedCount; j++)
+        {
+            if (PCTrackedTickets[j] == curTicket) { found = true; break; }
+        }
+        if (found) continue;
+
+        // Is this a remainder of a dead tracked entry? If so, don't add it.
+        bool isRemainder = false;
+        for (int j = 0; j < PCTrackedCount; j++)
+        {
+            if (PCTrackedOpenTimes[j] != curOpenTime) continue;
+            if (!OrderSelect(PCTrackedTickets[j], SELECT_BY_TICKET, MODE_TRADES))
+            {
+                isRemainder = true;
+                break;
+            }
+        }
+        if (isRemainder) continue;
+
+        PCTrackedCount++;
+        ArrayResize(PCTrackedTickets, PCTrackedCount);
+        ArrayResize(PCTrackedOpenTimes, PCTrackedCount);
+        PCTrackedTickets[PCTrackedCount - 1] = curTicket;
+        PCTrackedOpenTimes[PCTrackedCount - 1] = curOpenTime;
     }
 }
 
@@ -320,6 +641,163 @@ void CleanPanel()
     ObjectsDeleteAll(ChartID(), IndicatorName + "-P-");
 }
 
+//+------------------------------------------------------------------+
+//| BE Trigger Line Display Functions                                |
+//+------------------------------------------------------------------+
+
+// Check if an order's BE has already been triggered.
+// For a Buy, BE is triggered when the SL has been moved to at least OpenPrice + AdditionalProfit.
+// For a Sell, BE is triggered when the SL has been moved to at most OpenPrice - AdditionalProfit.
+bool IsBEAlreadyTriggered(int orderType, double openPrice, double currentSL, double ePoint)
+{
+    if (currentSL == 0) return false; // No SL set at all.
+    if (orderType == OP_BUY)
+    {
+        double targetSL = openPrice + AdditionalProfit * ePoint;
+        if (currentSL >= targetSL - ePoint / 2) return true;
+    }
+    else if (orderType == OP_SELL)
+    {
+        double targetSL = openPrice - AdditionalProfit * ePoint;
+        if (currentSL <= targetSL + ePoint / 2) return true;
+    }
+    return false;
+}
+
+void DrawBELines()
+{
+    // Collect tickets that should have a visible line.
+    int activeTickets[];
+    int activeCount = 0;
+
+    // Get the time of the leftmost visible bar on the chart.
+    int firstVisibleBar = (int)ChartGetInteger(ChartID(), CHART_FIRST_VISIBLE_BAR);
+    datetime leftEdgeTime = iTime(Symbol(), Period(), firstVisibleBar);
+
+    for (int i = 0; i < OrdersTotal(); i++)
+    {
+        if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES) == false) continue;
+
+        // Lines are price-based   only meaningful for the chart's own symbol.
+        if (OrderSymbol() != Symbol()) continue;
+
+        // Apply the same filters the EA uses.
+        if ((UseMagic) && (OrderMagicNumber() != MagicNumber)) continue;
+        if ((UseComment) && (StringFind(OrderComment(), CommentFilter) < 0)) continue;
+        if ((OnlyType != All) && (OrderType() != OnlyType)) continue;
+        // Skip pending orders.
+        if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+
+        int    ticket    = OrderTicket();
+        double openPrice = OrderOpenPrice();
+        double ePoint    = SymbolInfoDouble(OrderSymbol(), SYMBOL_POINT);
+        int    eDigits   = (int)SymbolInfoInteger(OrderSymbol(), SYMBOL_DIGITS);
+
+        // If BE has already been triggered for this order, remove its line and skip.
+        if (IsBEAlreadyTriggered(OrderType(), openPrice, OrderStopLoss(), ePoint))
+        {
+            DeleteBELineForTicket(ticket);
+            continue;
+        }
+
+        // Calculate the BE trigger price level.
+        double triggerPrice = 0;
+        if (OrderType() == OP_BUY)
+            triggerPrice = openPrice + DistanceFromOpen * ePoint;
+        else if (OrderType() == OP_SELL)
+            triggerPrice = openPrice - DistanceFromOpen * ePoint;
+
+        triggerPrice = NormalizeDouble(triggerPrice, eDigits);
+
+        // Track this ticket as active.
+        activeCount++;
+        ArrayResize(activeTickets, activeCount);
+        activeTickets[activeCount - 1] = ticket;
+
+        // Draw or update the horizontal line.
+        string lineName  = BELinePrefix  + IntegerToString(ticket);
+        string labelName = BELabelPrefix + IntegerToString(ticket);
+
+        ObjectCreate(ChartID(), lineName, OBJ_HLINE, 0, 0, triggerPrice);
+        ObjectSetDouble(ChartID(), lineName, OBJPROP_PRICE, triggerPrice);
+        ObjectSetInteger(ChartID(), lineName, OBJPROP_COLOR, BELineColor);
+        ObjectSetInteger(ChartID(), lineName, OBJPROP_STYLE, BELineStyle);
+        ObjectSetInteger(ChartID(), lineName, OBJPROP_WIDTH, BELineWidth);
+        ObjectSetInteger(ChartID(), lineName, OBJPROP_BACK, true);
+        ObjectSetInteger(ChartID(), lineName, OBJPROP_SELECTABLE, false);
+        ObjectSetInteger(ChartID(), lineName, OBJPROP_HIDDEN, true);
+        ObjectSetString(ChartID(), lineName, OBJPROP_TOOLTIP, "BE trigger for #" + IntegerToString(ticket));
+
+        // Text label near the line.
+        string typeStr = (OrderType() == OP_BUY) ? "Buy" : "Sell";
+        string labelText = "BE #" + IntegerToString(ticket) + " " + typeStr;
+
+        ObjectCreate(ChartID(), labelName, OBJ_TEXT, 0, leftEdgeTime, triggerPrice);
+        ObjectSetDouble(ChartID(), labelName, OBJPROP_PRICE, triggerPrice);
+        ObjectSetInteger(ChartID(), labelName, OBJPROP_TIME, leftEdgeTime);
+        ObjectSetString(ChartID(), labelName, OBJPROP_TEXT, labelText);
+        ObjectSetInteger(ChartID(), labelName, OBJPROP_COLOR, BELineColor);
+        ObjectSetInteger(ChartID(), labelName, OBJPROP_FONTSIZE, BELabelFontSize);
+        ObjectSetString(ChartID(), labelName, OBJPROP_FONT, "Arial");
+        ObjectSetInteger(ChartID(), labelName, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+        ObjectSetInteger(ChartID(), labelName, OBJPROP_SELECTABLE, false);
+        ObjectSetInteger(ChartID(), labelName, OBJPROP_HIDDEN, true);
+        ObjectSetInteger(ChartID(), labelName, OBJPROP_BACK, false);
+    }
+
+    // Clean up lines for orders no longer in the active set.
+    PurgeStaleBELines(activeTickets, activeCount);
+}
+
+//+------------------------------------------------------------------+
+//| Remove the BE line and label for a specific ticket.              |
+//+------------------------------------------------------------------+
+void DeleteBELineForTicket(int ticket)
+{
+    string lineName  = BELinePrefix  + IntegerToString(ticket);
+    string labelName = BELabelPrefix + IntegerToString(ticket);
+    ObjectDelete(ChartID(), lineName);
+    ObjectDelete(ChartID(), labelName);
+}
+
+//+------------------------------------------------------------------+
+//| Remove BE lines/labels for tickets NOT in the active set.        |
+//+------------------------------------------------------------------+
+void PurgeStaleBELines(int &activeTickets[], int activeCount)
+{
+    int totalObjects = ObjectsTotal(ChartID());
+    // Iterate backwards since we may delete objects.
+    for (int i = totalObjects - 1; i >= 0; i--)
+    {
+        string objName = ObjectName(ChartID(), i);
+        bool isLine  = (StringFind(objName, BELinePrefix)  == 0);
+        bool isLabel = (StringFind(objName, BELabelPrefix) == 0);
+        if (!isLine && !isLabel) continue;
+
+        // Extract the ticket number from the object name.
+        string prefix = isLine ? BELinePrefix : BELabelPrefix;
+        string ticketStr = StringSubstr(objName, StringLen(prefix));
+        int ticket = (int)StringToInteger(ticketStr);
+
+        // Check if this ticket is in the active set.
+        bool found = false;
+        for (int k = 0; k < activeCount; k++)
+        {
+            if (activeTickets[k] == ticket) { found = true; break; }
+        }
+        if (!found) ObjectDelete(ChartID(), objName);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Remove ALL BE-related chart objects.                             |
+//+------------------------------------------------------------------+
+void CleanBELines()
+{
+    ObjectsDeleteAll(ChartID(), BELinePrefix);
+    ObjectsDeleteAll(ChartID(), BELabelPrefix);
+}
+
 void ChangeTrailingEnabled()
 {
     if (EnableTrailing == false)
@@ -331,12 +809,18 @@ void ChangeTrailingEnabled()
         }
         if (!MQLInfoInteger(MQL_TRADE_ALLOWED))
         {
-            MessageBox("Live Trading is disabled in the expert advisors's settings! Please tick the Allow Live Trading checkbox on the Common tab.", "WARNING", MB_OK);
+            MessageBox("Live Trading is disabled in the expert advisor's settings! Please tick the Allow Live Trading checkbox on the Common tab.", "WARNING", MB_OK);
             return;
         }
         EnableTrailing = true;
+        if (partialCloseEnabled) BuildTrackedList();
+        if (ShowBELines) DrawBELines();
     }
-    else EnableTrailing = false;
+    else
+    {
+        EnableTrailing = false;
+        if (ShowBELines) CleanBELines();
+    }
     DrawPanel();
 }
 
